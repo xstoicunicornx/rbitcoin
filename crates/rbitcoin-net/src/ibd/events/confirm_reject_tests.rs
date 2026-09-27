@@ -1952,9 +1952,11 @@ fn apply_peer_event_body_and_control_surface() {
     );
     assert!(!st.headers_done);
 
-    // NotFound clears peer inflight.
+    // NotFound clears peer inflight and reopens the height for densify.
     st.slots[0].in_flight.insert(h(3));
     st.inflight.insert(h(3), InflightReq::new(1));
+    st.record_height(h(3), 30);
+    st.densify_scan_lo = 50;
     apply_peer_event(
         &mut st,
         &hub,
@@ -1968,6 +1970,10 @@ fn apply_peer_event_body_and_control_surface() {
         None,
     );
     assert!(!st.inflight.contains_key(&h(3)));
+    assert_eq!(
+        st.densify_scan_lo, 30,
+        "notfound hash is below the densify cursor"
+    );
 
     // Addrs + inject filter.
     inject_learned_addrs(&mut book, &[], local, 1);
@@ -1992,9 +1998,11 @@ fn apply_peer_event_body_and_control_surface() {
         "IBD addrv2 onion must enter the dial book"
     );
 
-    // Dead releases work.
+    // Dead releases work and reopens its heights for densify.
     st.slots[0].in_flight.insert(h(4));
     st.inflight.insert(h(4), InflightReq::new(1));
+    st.record_height(h(4), 40);
+    st.densify_scan_lo = 50;
     apply_peer_event(
         &mut st,
         &hub,
@@ -2009,6 +2017,10 @@ fn apply_peer_event_body_and_control_surface() {
     );
     assert!(!st.slots[0].alive);
     assert!(!st.inflight.contains_key(&h(4)));
+    assert_eq!(
+        st.densify_scan_lo, 40,
+        "dead peer's hash is below the densify cursor"
+    );
 
     // Drain empty channels.
     let (body_tx, mut body_rx) = mpsc::unbounded_channel();

@@ -658,7 +658,7 @@ pub async fn ibd_cancellable(
         if cadence.peer_slow_due(now_cadence) {
             sample_peer_rates(&mut st.slots, peer_io::ibd_mono_ms());
             let now = Instant::now();
-            disconnect_stalled_block_peers(
+            let mut freed = disconnect_stalled_block_peers(
                 &mut st.slots,
                 &mut st.inflight,
                 &mut st.addr_cooldown,
@@ -666,7 +666,7 @@ pub async fn ibd_cancellable(
                 now,
                 cfg.stall,
             );
-            disconnect_relative_slow_block_peers(
+            freed.extend(disconnect_relative_slow_block_peers(
                 &mut st.slots,
                 &mut st.inflight,
                 &mut st.addr_cooldown,
@@ -675,7 +675,8 @@ pub async fn ibd_cancellable(
                 peer_sess.book(),
                 &mut st.relative_slow_suspect,
                 &mut st.relative_slow_last_kick_ms,
-            );
+            ));
+            st.reopen_for_densify(&freed);
             expire_addr_cooldown(&mut st.addr_cooldown, now);
             cadence.mark_peer_slow(now);
         }

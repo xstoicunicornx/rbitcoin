@@ -236,6 +236,19 @@ impl IbdWorkState {
     ///
     /// Tests / reorg gather may plant a slot. Header intake uses
     /// [`Self::try_set_path_slot`] (first-wins, prev-anchored).
+    /// Hashes that left `inflight` without arriving. Densify skips forward past
+    /// requested heights and never walks below `densify_scan_lo`, so move the
+    /// cursor back to the lowest of them or densify will not request them again.
+    pub(crate) fn reopen_for_densify(&mut self, freed: &[BlockHash]) {
+        let lowest = freed
+            .iter()
+            .filter_map(|h| self.hash_height.get(h).copied())
+            .min();
+        if let Some(lo) = lowest {
+            self.densify_scan_lo = self.densify_scan_lo.min(lo);
+        }
+    }
+
     pub(crate) fn record_height(&mut self, hash: BlockHash, ht: u32) {
         if let Some(old) = self.hash_height.insert(hash, ht) {
             if old != ht && self.height_to_hash.get(&old) == Some(&hash) {
@@ -385,6 +398,18 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert!(r.remove_peer(2));
         assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn reopen_for_densify_rewinds_to_lowest_freed_height() {
+        let mut st = IbdWorkState::new(Vec::new(), Some(h(0)), Some(0));
+        st.record_height(h(30), 30);
+        st.record_height(h(40), 40);
+        st.densify_scan_lo = 50;
+        st.reopen_for_densify(&[h(40), h(30), h(99)]);
+        assert_eq!(st.densify_scan_lo, 30, "unknown heights are ignored");
+        st.reopen_for_densify(&[h(40)]);
+        assert_eq!(st.densify_scan_lo, 30, "never moves the cursor forward");
     }
 
     #[test]

@@ -542,6 +542,7 @@ fn apply_block_decode_failed(st: &mut IbdWorkState, peer: usize, hash: BlockHash
 
 fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
     note_block_progress(&mut st.slots, peer);
+    let mut freed = Vec::new();
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
         for h in &hashes {
             s.in_flight.remove(h);
@@ -552,9 +553,11 @@ fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
                 .unwrap_or(false);
             if empty {
                 st.inflight.remove(h);
+                freed.push(*h);
             }
         }
     }
+    st.reopen_for_densify(&freed);
 }
 
 fn apply_peer_dead(st: &mut IbdWorkState, peer_book: &mut AddrMan, peer: usize, reason: String) {
@@ -575,7 +578,8 @@ fn apply_peer_dead(st: &mut IbdWorkState, peer_book: &mut AddrMan, peer: usize, 
             st.addr_cooldown.contains_key(&s.addr),
         );
     }
-    release_peer_block_work(&mut st.slots, &mut st.inflight, peer);
+    let freed = release_peer_block_work(&mut st.slots, &mut st.inflight, peer);
+    st.reopen_for_densify(&freed);
 }
 
 /// Grow the IBD dial book from peer-advertised addresses (getaddr responses).

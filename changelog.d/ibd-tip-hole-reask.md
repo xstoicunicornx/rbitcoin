@@ -11,3 +11,8 @@ Fixed
   so the owner was dropped and replaced on every 50ms assign pass. It is
   now dropped only after holding the hash for 5s, and only when a free
   peer's expected drain time is at most half the owner's.
+- **Blocks held by a dropped peer are requested again right away.** A
+  peer disconnected as stalled or relative-slow, or a notfound, freed its
+  blocks, but densify had already moved its scan cursor past them, so they
+  were requested again only once they held up the tip. The cursor now moves
+  back to the lowest freed height.

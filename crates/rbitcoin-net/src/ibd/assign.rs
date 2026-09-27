@@ -2707,6 +2707,50 @@ pub(in crate::ibd) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Work freed below the densify cursor is requested again once the cursor
+    /// is rewound, not only when it becomes a tip hole. The path ends below the
+    /// cursor so the first pass has nothing to request and peer slots stay free.
+    #[test]
+    fn densify_reissues_work_reopened_below_scan_lo() {
+        let _env = lock_default_assign_stop();
+        use super::super::dial::release_peer_block_work;
+        use super::super::state::InflightReq;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![dummy_slot(0), dummy_slot(1), dummy_slot(2)],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 128;
+        cfg.per_peer = 16;
+        let path_lo = hub.tip_height().unwrap_or(0).saturating_add(1);
+        plant_work_path(&mut st, path_lo, 49);
+        mark_tip_batch_ready(&mut st, &hub, path_lo);
+        seed_ewma(&mut st.slots[1], 1_000_000);
+        seed_ewma(&mut st.slots[2], 1_000_000);
+        let lost = h(45);
+        st.inflight.insert(lost, InflightReq::new(0));
+        st.slots[0].in_flight.insert(lost);
+        st.densify_scan_lo = 50;
+        let freed = release_peer_block_work(&mut st.slots, &mut st.inflight, 0);
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        assert!(
+            !st.inflight.contains_key(&lost),
+            "below the cursor, densify does not see freed work"
+        );
+        st.reopen_for_densify(&freed);
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        assert!(
+            st.inflight.contains_key(&lost),
+            "reopened work is requested again; scan_lo={}",
+            st.densify_scan_lo
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn densify_skips_band_walk_when_peers_at_cap() {
         let _env = lock_default_assign_stop();

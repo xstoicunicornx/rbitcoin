@@ -467,11 +467,15 @@ pub(crate) fn ibd_header_locator(
     Ok(locator)
 }
 
+/// Mark `peer` dead and drop it from every hash it holds. Returns the hashes
+/// no other peer still holds: they are no longer requested and need
+/// [`super::state::IbdWorkState::reopen_for_densify`].
 pub(crate) fn release_peer_block_work(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
     peer: usize,
-) {
+) -> Vec<bitcoin::BlockHash> {
+    let mut freed = Vec::new();
     if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
         s.alive = false;
         for h in s.in_flight.drain() {
@@ -481,9 +485,11 @@ pub(crate) fn release_peer_block_work(
                 .unwrap_or(false);
             if empty {
                 inflight.remove(&h);
+                freed.push(h);
             }
         }
     }
+    freed
 }
 
 /// When every dialable address is live or cooling, drop the cooling address
@@ -613,7 +619,7 @@ pub(crate) fn disconnect_stalled_block_peers(
     addr_strikes: &mut HashMap<SocketAddr, u8>,
     now: Instant,
     stall: Duration,
-) {
+) -> Vec<bitcoin::BlockHash> {
     disconnect_stalled_block_peers_at(
         slots,
         inflight,
@@ -622,7 +628,7 @@ pub(crate) fn disconnect_stalled_block_peers(
         now,
         stall,
         ibd_mono_ms(),
-    );
+    )
 }
 
 pub(crate) fn disconnect_stalled_block_peers_at(
@@ -633,7 +639,8 @@ pub(crate) fn disconnect_stalled_block_peers_at(
     now: Instant,
     stall: Duration,
     now_ms: u64,
-) {
+) -> Vec<bitcoin::BlockHash> {
+    let mut freed = Vec::new();
     let stall = stall.max(Duration::from_secs(30));
     let stall_ms = stall.as_millis() as u64;
     let stalled_peers: Vec<(usize, usize, SocketAddr)> = slots
@@ -651,8 +658,9 @@ pub(crate) fn disconnect_stalled_block_peers_at(
             let _ = s.cmd_tx.send(PeerCmd::Shutdown);
             s.task.abort();
         }
-        release_peer_block_work(slots, inflight, id);
+        freed.extend(release_peer_block_work(slots, inflight, id));
     }
+    freed
 }
 
 /// Disconnect at most one **clear quarter-median outlier** (warm-up + cluster gate
@@ -671,7 +679,7 @@ pub(crate) fn disconnect_relative_slow_block_peers(
     book: &AddrMan,
     suspect: &mut Option<(usize, u64)>,
     last_kick_ms: &mut u64,
-) {
+) -> Vec<bitcoin::BlockHash> {
     disconnect_relative_slow_block_peers_at(
         slots,
         inflight,
@@ -682,7 +690,7 @@ pub(crate) fn disconnect_relative_slow_block_peers(
         suspect,
         last_kick_ms,
         ibd_mono_ms(),
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
@@ -696,31 +704,31 @@ pub(crate) fn disconnect_relative_slow_block_peers_at(
     suspect: &mut Option<(usize, u64)>,
     last_kick_ms: &mut u64,
     now_ms: u64,
-) {
+) -> Vec<bitcoin::BlockHash> {
     if !relative_slow_global_warmup_at(slots, now_ms) {
         *suspect = None;
-        return;
+        return Vec::new();
     }
     if !replacement_available(book, slots, addr_cooldown, now) {
         *suspect = None;
-        return;
+        return Vec::new();
     }
     let alive = slots.iter().filter(|s| s.alive).count();
     let min_samples = relative_slow_min_samples(alive);
     let samples = mature_relative_slow_samples(slots, now_ms);
     if samples.len() < min_samples {
         *suspect = None;
-        return;
+        return Vec::new();
     }
     let (kick, next_suspect) =
         relative_slow_with_hysteresis(&samples, min_samples, now_ms, *suspect, *last_kick_ms);
     *suspect = next_suspect;
     let Some(id) = kick else {
-        return;
+        return Vec::new();
     };
     let Some(slot) = slots.iter().find(|s| s.id == id && s.alive) else {
         *suspect = None;
-        return;
+        return Vec::new();
     };
     let addr = slot.addr;
     let n_work = slot.in_flight.len();
@@ -746,9 +754,10 @@ pub(crate) fn disconnect_relative_slow_block_peers_at(
         let _ = s.cmd_tx.send(PeerCmd::Shutdown);
         s.task.abort();
     }
-    release_peer_block_work(slots, inflight, id);
+    let freed = release_peer_block_work(slots, inflight, id);
     *suspect = None;
     *last_kick_ms = now_ms;
+    freed
 }
 
 #[cfg(test)]
@@ -1183,6 +1192,27 @@ mod tests {
         inflight.insert(h, super::super::state::InflightReq::new(3));
         release_peer_block_work(&mut [slot], &mut inflight, 3);
         assert!(inflight.is_empty());
+    }
+
+    #[test]
+    fn release_peer_block_work_returns_hashes_left_unrequested() {
+        let mut slot = dummy_slot(3, addr(9), true);
+        let sole = BlockHash::from_byte_array([7u8; 32]);
+        let shared = BlockHash::from_byte_array([8u8; 32]);
+        slot.in_flight.insert(sole);
+        slot.in_flight.insert(shared);
+        let mut inflight = HashMap::new();
+        inflight.insert(sole, super::super::state::InflightReq::new(3));
+        let mut both = super::super::state::InflightReq::new(3);
+        both.add_peer(4);
+        inflight.insert(shared, both);
+        let freed = release_peer_block_work(&mut [slot], &mut inflight, 3);
+        assert_eq!(
+            freed,
+            vec![sole],
+            "a hash another peer still holds stays requested"
+        );
+        assert!(inflight.contains_key(&shared));
     }
 
     #[test]
