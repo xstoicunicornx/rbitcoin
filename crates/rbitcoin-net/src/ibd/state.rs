@@ -39,9 +39,18 @@ pub(crate) struct WorkStructureSizes {
 ///
 /// Near/far densify use a single peer. Tip-hole hashes race up to
 /// [`super::TIP_HOLE_MAX_PEERS`] immediately.
+///
+/// Getdata cannot be cancelled. A peer dropped from the race moves to
+/// `retired`: it no longer counts as a racer, but it still holds the request,
+/// so the hash stays requested and that peer is not asked for it again.
 #[derive(Debug, Clone)]
 pub(crate) struct InflightReq {
+    /// Racing owners.
     pub peers: HashSet<usize>,
+    /// When each racing owner was asked.
+    pub asked_at: HashMap<usize, Instant>,
+    /// Dropped from the race; still holding the getdata.
+    pub retired: HashSet<usize>,
     /// When this hash first entered global inflight (stale tip-hole re-get).
     pub started_at: Instant,
 }
@@ -50,6 +59,8 @@ impl Default for InflightReq {
     fn default() -> Self {
         Self {
             peers: HashSet::new(),
+            asked_at: HashMap::new(),
+            retired: HashSet::new(),
             started_at: Instant::now(),
         }
     }
@@ -57,31 +68,51 @@ impl Default for InflightReq {
 
 impl InflightReq {
     pub(crate) fn new(peer: usize) -> Self {
-        let mut peers = HashSet::with_capacity(1);
-        peers.insert(peer);
-        Self {
-            peers,
-            started_at: Instant::now(),
-        }
+        let mut r = Self::default();
+        r.add_peer(peer);
+        r
     }
 
-    pub(crate) fn contains_peer(&self, peer: usize) -> bool {
-        self.peers.contains(&peer)
+    /// Racing or retired: `peer` has been sent this getdata and not answered.
+    pub(crate) fn holds(&self, peer: usize) -> bool {
+        self.peers.contains(&peer) || self.retired.contains(&peer)
     }
 
+    /// Racing owners only.
     pub(crate) fn len(&self) -> usize {
         self.peers.len()
     }
 
     /// Returns true if `peer` was newly added.
     pub(crate) fn add_peer(&mut self, peer: usize) -> bool {
-        self.peers.insert(peer)
+        self.retired.remove(&peer);
+        let added = self.peers.insert(peer);
+        if added {
+            self.asked_at.insert(peer, Instant::now());
+        }
+        added
     }
 
-    /// Remove `peer`. Returns true if no peers remain (caller should drop the hash).
+    /// When racing owner `peer` was asked.
+    pub(crate) fn owner_asked_at(&self, peer: usize) -> Option<Instant> {
+        self.asked_at.get(&peer).copied()
+    }
+
+    /// Stop counting `peer` as a racer. It keeps the request.
+    pub(crate) fn retire_peer(&mut self, peer: usize) {
+        if self.peers.remove(&peer) {
+            self.asked_at.remove(&peer);
+            self.retired.insert(peer);
+        }
+    }
+
+    /// `peer` no longer holds the request (answered, notfound, or gone).
+    /// Returns true if no holder remains (caller should drop the hash).
     pub(crate) fn remove_peer(&mut self, peer: usize) -> bool {
         self.peers.remove(&peer);
-        self.peers.is_empty()
+        self.asked_at.remove(&peer);
+        self.retired.remove(&peer);
+        self.peers.is_empty() && self.retired.is_empty()
     }
 }
 
@@ -346,7 +377,7 @@ mod tests {
     fn inflight_req_multi_peer_add_remove() {
         let mut r = InflightReq::new(1);
         assert_eq!(r.len(), 1);
-        assert!(r.contains_peer(1));
+        assert!(r.peers.contains(&1));
         assert!(r.add_peer(2));
         assert!(!r.add_peer(2)); // already present
         assert_eq!(r.len(), 2);
@@ -354,6 +385,27 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert!(r.remove_peer(2));
         assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn inflight_req_retired_peer_still_holds_the_hash() {
+        let mut r = InflightReq::new(1);
+        assert!(r.add_peer(2));
+        r.retire_peer(1);
+        assert_eq!(r.len(), 1, "retired peer no longer races");
+        assert!(!r.peers.contains(&1));
+        assert!(r.holds(1), "retired peer still has the getdata");
+        assert!(r.owner_asked_at(1).is_none());
+        assert!(r.owner_asked_at(2).is_some());
+        r.retire_peer(2);
+        assert_eq!(r.len(), 0);
+        assert!(r.holds(2));
+        assert!(
+            !r.remove_peer(1),
+            "hash stays requested while a holder remains"
+        );
+        assert!(r.remove_peer(2));
+        assert!(!r.holds(1) && !r.holds(2));
     }
 
     #[test]
