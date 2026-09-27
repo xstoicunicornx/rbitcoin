@@ -31,6 +31,7 @@ use super::dial::{
 };
 use super::peer_io::{ibd_mono_ms, PeerCmd, PeerSlot};
 use super::state::{self, IbdWorkState};
+use super::wire_diag::{AskSite, Erase};
 use super::status::LoopStats;
 use super::{
     IbdConfig, CONTIG_DENSIFY_AHEAD, FAR_SCAN_BUDGET, PENDING_STALE, PRE_HOLE_MAX_PEERS,
@@ -343,7 +344,7 @@ fn assign_reorg_need(
             if !peer_has_slot(st, pid, cfg.per_peer) {
                 continue;
             }
-            if issue_one(st, pid, h, &mut room, &mut issued) {
+            if issue_one(st, pid, h, &mut room, &mut issued, AskSite::ReorgNeed) {
                 break;
             }
         }
@@ -454,7 +455,7 @@ fn assign_densify(
             let Some(h) = pop_need(&mut densify_q, st, hub) else {
                 break;
             };
-            if !issue_one(st, pid, h, &mut room, &mut issued) {
+            if !issue_one(st, pid, h, &mut room, &mut issued, AskSite::Densify) {
                 break;
             }
         }
@@ -606,8 +607,9 @@ pub(crate) fn issue_one(
     h: BlockHash,
     room: &mut usize,
     issued: &mut u64,
+    site: AskSite,
 ) -> bool {
-    issue_batch(st, pid, vec![h], room, issued)
+    issue_batch(st, pid, vec![h], room, issued, site)
 }
 
 /// Bytes reserved per outstanding getdata hash when the peer did not announce a size.
@@ -629,6 +631,7 @@ pub(crate) fn issue_batch(
     batch: Vec<BlockHash>,
     room: &mut usize,
     issued: &mut u64,
+    site: AskSite,
 ) -> bool {
     if batch.is_empty() {
         return false;
@@ -667,7 +670,7 @@ pub(crate) fn issue_batch(
     let _ = st.slots[idx].cmd_tx.send(PeerCmd::GetData {
         hashes: batch.clone(),
     });
-    st.wire_diag.note_asks(pid, &batch, Instant::now());
+    st.wire_diag.note_asks(pid, &batch, site, Instant::now());
     for &h in &batch {
         inflight_add_peer(&mut st.inflight, h, pid);
     }
@@ -990,14 +993,16 @@ pub(crate) fn tip_hole_owner_to_drop(
 
 /// Stop counting `pid` as a racer on `hash`. Getdata cannot be cancelled, so
 /// the peer keeps the request in its `in_flight` and is not asked again.
-fn retire_hash_owner(st: &mut IbdWorkState, hash: BlockHash, pid: usize) {
+fn retire_hash_owner(st: &mut IbdWorkState, hash: BlockHash, pid: usize, why: Erase) {
+    st.wire_diag.note_erase(&hash, pid, why);
     if let Some(req) = st.inflight.get_mut(&hash) {
         req.retire_peer(pid);
     }
 }
 
 /// Forget that `pid` was asked for `hash` so densify can issue it afresh.
-fn forget_hash_owner(st: &mut IbdWorkState, hash: BlockHash, pid: usize) {
+fn forget_hash_owner(st: &mut IbdWorkState, hash: BlockHash, pid: usize, why: Erase) {
+    st.wire_diag.note_erase(&hash, pid, why);
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == pid) {
         s.in_flight.remove(&hash);
     }
@@ -1124,11 +1129,11 @@ fn steal_hung_densify(
             .find(|&pid| peer_has_slot(st, pid, densify_caps.get(&pid).copied().unwrap_or(1)));
         let ht = st.hash_height.get(&h).copied();
         if let Some(pid) = dest {
-            retire_hash_owner(st, h, owner);
+            retire_hash_owner(st, h, owner, Erase::StealRetire);
             let mut room = 1usize;
-            let _ = issue_one(st, pid, h, &mut room, &mut issued);
+            let _ = issue_one(st, pid, h, &mut room, &mut issued, AskSite::StealHung);
         } else {
-            forget_hash_owner(st, h, owner);
+            forget_hash_owner(st, h, owner, Erase::StealForget);
             if let Some(ht) = ht {
                 st.densify_scan_lo = st.densify_scan_lo.min(ht);
             }
@@ -1242,7 +1247,7 @@ pub(crate) fn cover_tip_holes(
         let mut avoid: HashSet<usize> = HashSet::new();
         if let Some(req) = st.inflight.get(&h) {
             if let Some(pid) = tip_hole_owner_to_drop(req, &h, &st.slots, cfg.per_peer) {
-                retire_hash_owner(st, h, pid);
+                retire_hash_owner(st, h, pid, Erase::TipHoleRetire);
                 avoid.insert(pid);
             }
         }
@@ -1274,7 +1279,7 @@ pub(crate) fn cover_tip_holes(
                 continue;
             }
             let mut room = 1usize;
-            if issue_one(st, pid, h, &mut room, &mut issued) {
+            if issue_one(st, pid, h, &mut room, &mut issued, AskSite::TipHole) {
                 placed_any = true;
                 need = need.saturating_sub(1);
             }
@@ -1487,10 +1492,10 @@ pub(in crate::ibd) mod tests {
 
         let mut room = 10usize;
         let mut issued = 0u64;
-        assert!(!issue_one(&mut st, 99, h(30), &mut room, &mut issued));
-        assert!(!issue_batch(&mut st, 0, vec![], &mut room, &mut issued));
+        assert!(!issue_one(&mut st, 99, h(30), &mut room, &mut issued, AskSite::Test));
+        assert!(!issue_batch(&mut st, 0, vec![], &mut room, &mut issued, AskSite::Test));
         st.body.mark_missing(h(30));
-        assert!(issue_one(&mut st, 0, h(30), &mut room, &mut issued));
+        assert!(issue_one(&mut st, 0, h(30), &mut room, &mut issued, AskSite::Test));
         assert!(issued >= 1);
         assert!(st.inflight.contains_key(&h(30)));
         assert!(st.slots[0].in_flight.contains(&h(30)));
@@ -1512,7 +1517,7 @@ pub(in crate::ibd) mod tests {
         let mut room = 10usize;
         let mut issued = 0u64;
         let t0 = super::super::peer_io::ibd_mono_ms();
-        assert!(issue_one(&mut st, 0, h(30), &mut room, &mut issued));
+        assert!(issue_one(&mut st, 0, h(30), &mut room, &mut issued, AskSite::Test));
         let t1 = super::super::peer_io::ibd_mono_ms();
         assert_eq!(st.slots[0].rate.progress_ms, 42);
         assert!(st.slots[0].rate.work_started_ms >= t0);
@@ -3424,20 +3429,20 @@ pub(in crate::ibd) mod tests {
         let mut room = 10usize;
         let mut issued = 0u64;
         assert!(
-            !issue_one(&mut st, 0, h(32), &mut room, &mut issued),
+            !issue_one(&mut st, 0, h(32), &mut room, &mut issued, AskSite::Test),
             "one byte under 4 MiB cannot reserve a new hash"
         );
         assert!(st.inflight.is_empty());
 
         st.intake_stop = four_mib;
         assert!(
-            issue_one(&mut st, 0, h(31), &mut room, &mut issued),
+            issue_one(&mut st, 0, h(31), &mut room, &mut issued, AskSite::Test),
             "one new hash fits in exactly 4 MiB"
         );
         assert!(st.inflight.contains_key(&h(31)));
         let before = st.inflight.len();
         assert!(
-            !issue_one(&mut st, 0, h(33), &mut room, &mut issued),
+            !issue_one(&mut st, 0, h(33), &mut room, &mut issued, AskSite::Test),
             "a second hash would pass the 4 MiB stop"
         );
         assert_eq!(st.inflight.len(), before);
