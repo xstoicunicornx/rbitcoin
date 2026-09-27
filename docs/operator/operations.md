@@ -303,7 +303,8 @@ block getdata in flight. Tip+1 getdata races up to 4 peers ranked by expected
 drain time (`(queue+1)/EWMA`), not by inflight count. Later contiguous holes
 in that gap get one racer until tip+1 is in hand. A hole owner still serving
 other getdata (densify FIFO) is dropped from that hash so a peer that can start
-the hole can race; a hole owner with no qualifying rx is dropped when a sibling
+the hole can race, once it has held the hash ≥5s and a free peer's expected
+drain time is at most half the owner's; a hole owner with no qualifying rx is dropped when a sibling
 is pulling; a solo owner that has held the hash ≥30s is dropped when another
 peer exists. Getdata cannot be cancelled, so a dropped owner keeps the request,
 still counts toward its in-flight queue, and is never asked for that hash

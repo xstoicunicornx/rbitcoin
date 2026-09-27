@@ -846,19 +846,58 @@ fn hole_owner_fifo_blocked(slot: &PeerSlot) -> bool {
     slot.in_flight.len() > 1
 }
 
-/// Drop an owner whose peer FIFO is not on this hash when another live peer exists.
-fn fifo_blocked_owner_to_drop(owners: &[usize], slots: &[PeerSlot]) -> Option<usize> {
+/// A FIFO-blocked owner is not dropped until it has held the hash this long.
+/// Every peer has other getdata in flight during IBD, so without a hold time
+/// the rule fires on every assign pass.
+const TIP_HOLE_FIFO_MIN_HOLD: Duration = Duration::from_secs(5);
+
+/// A free peer must be expected to start the hash in at most 1/this of the
+/// owner's drain time before a FIFO-blocked owner is dropped for it.
+const TIP_HOLE_FIFO_FASTER: u128 = 2;
+
+/// Drop an owner whose peer FIFO is not on this hash when it has held the hash
+/// for [`TIP_HOLE_FIFO_MIN_HOLD`] and a free peer would start it at least
+/// [`TIP_HOLE_FIFO_FASTER`]× sooner by `(queue+1)/bps`.
+fn fifo_blocked_owner_to_drop(
+    req: &state::InflightReq,
+    hash: &BlockHash,
+    slots: &[PeerSlot],
+    per_peer: usize,
+) -> Option<usize> {
     if slots.iter().filter(|s| s.alive).count() <= 1 {
         return None;
     }
-    owners
+    let (free_q, free_bps) = slots
+        .iter()
+        .filter(|s| {
+            s.alive
+                && !req.holds(s.id)
+                && !s.in_flight.contains(hash)
+                && s.in_flight.len() < per_peer
+        })
+        .map(|s| (s.in_flight.len(), peer_bps(slots, s.id)))
+        .min_by(|&(qa, ba), &(qb, bb)| tip_hole_drain_cmp(qa, ba, qb, bb))?;
+    let now = Instant::now();
+    req.peers
         .iter()
         .copied()
         .filter(|&id| {
-            slots
-                .iter()
-                .find(|s| s.id == id && s.alive)
-                .is_some_and(hole_owner_fifo_blocked)
+            let Some(slot) = slots.iter().find(|s| s.id == id && s.alive) else {
+                return false;
+            };
+            if !hole_owner_fifo_blocked(slot) {
+                return false;
+            }
+            let held_long = req
+                .owner_asked_at(id)
+                .is_some_and(|t| now.duration_since(t) >= TIP_HOLE_FIFO_MIN_HOLD);
+            // free wait <= owner wait / FASTER, cross-multiplied as in tip_hole_drain_cmp.
+            let free_wait = (free_q as u128 + 1)
+                .saturating_mul(TIP_HOLE_FIFO_FASTER)
+                .saturating_mul(u128::from(peer_bps(slots, id).max(1)));
+            let owner_wait =
+                (slot.in_flight.len() as u128).saturating_mul(u128::from(free_bps.max(1)));
+            held_long && free_wait <= owner_wait
         })
         .max_by(|&a, &b| {
             peer_queue_len(slots, a)
@@ -870,28 +909,36 @@ fn fifo_blocked_owner_to_drop(owners: &[usize], slots: &[PeerSlot]) -> Option<us
 
 /// Which current owner of a tip-hole hash to drop from **this hash** (not disconnect).
 ///
-/// - Owner `in_flight.len() > 1` → densify still in front; drop when another
-///   alive peer exists (peer-level 64 KiB ticks are not progress on this hash).
+/// - Owner `in_flight.len() > 1` → densify may be in front; drop when it has
+///   held the hash ≥ [`TIP_HOLE_FIFO_MIN_HOLD`] and a free peer would start it
+///   clearly sooner (peer-level 64 KiB ticks are not progress on this hash).
 /// - No owner has recent rx → none (too early / first 64 KiB still in flight).
 /// - Some have recent rx, some do not → drop a no-rx owner (quick dead-racer).
 /// - All have recent rx → [`relative_slow_pick`] among those owners (`min_samples` =
 ///   owner count). Tight cluster → none.
-/// - Solo owner: drop when it has held the hash (`solo_since`, its own ask
-///   time) ≥ [`TIP_HOLE_RX_STALE`] and another alive peer exists. Getdata
+/// - Solo owner: drop when it has held the hash (its own ask time)
+///   ≥ [`TIP_HOLE_RX_STALE`] and another alive peer exists. Getdata
 ///   cannot be cancelled, so we stop counting that owner and race a faster
 ///   drain instead. One live peer stays so we do not drop the only remaining
 ///   request.
 pub(crate) fn tip_hole_owner_to_drop(
-    owners: &[usize],
+    req: &state::InflightReq,
+    hash: &BlockHash,
     slots: &[PeerSlot],
-    solo_since: Instant,
+    per_peer: usize,
 ) -> Option<usize> {
+    let owners: Vec<usize> = req.peers.iter().copied().collect();
+    let owners = owners.as_slice();
     if owners.is_empty() {
         return None;
     }
-    if let Some(id) = fifo_blocked_owner_to_drop(owners, slots) {
+    if let Some(id) = fifo_blocked_owner_to_drop(req, hash, slots, per_peer) {
         return Some(id);
     }
+    let solo_since = owners
+        .first()
+        .and_then(|&pid| req.owner_asked_at(pid))
+        .unwrap_or(req.started_at);
     let now_ms = ibd_mono_ms();
     let mut recent = Vec::new();
     let mut stale = Vec::new();
@@ -1193,12 +1240,7 @@ pub(crate) fn cover_tip_holes(
         demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht);
         let mut avoid: HashSet<usize> = HashSet::new();
         if let Some(req) = st.inflight.get(&h) {
-            let owners: Vec<usize> = req.peers.iter().copied().collect();
-            let solo_since = owners
-                .first()
-                .and_then(|&pid| req.owner_asked_at(pid))
-                .unwrap_or(req.started_at);
-            if let Some(pid) = tip_hole_owner_to_drop(&owners, &st.slots, solo_since) {
+            if let Some(pid) = tip_hole_owner_to_drop(req, &h, &st.slots, cfg.per_peer) {
                 retire_hash_owner(st, h, pid);
                 avoid.insert(pid);
             }
@@ -1584,66 +1626,93 @@ pub(in crate::ibd) mod tests {
     #[test]
     fn tip_hole_owner_to_drop_too_early_dead_racer_and_solo() {
         use super::super::peer_io::ibd_mono_ms;
+        use super::super::state::InflightReq;
+        fn req_with(owners: &[usize], since: Instant) -> InflightReq {
+            let mut r = InflightReq::default();
+            for &pid in owners {
+                r.add_peer(pid);
+                r.asked_at.insert(pid, since);
+            }
+            r
+        }
+        let hole = h(1);
+        let per_peer = 16;
         let mut slots = vec![dummy_slot(0), dummy_slot(1)];
         let started = Instant::now();
         assert_eq!(
-            tip_hole_owner_to_drop(&[0, 1], &slots, started),
+            tip_hole_owner_to_drop(&req_with(&[0, 1], started), &hole, &slots, per_peer),
             None,
             "no rx yet is too early"
         );
         slots[1].rate.note_rx(ibd_mono_ms().max(1));
         assert_eq!(
-            tip_hole_owner_to_drop(&[0, 1], &slots, started),
+            tip_hole_owner_to_drop(&req_with(&[0, 1], started), &hole, &slots, per_peer),
             Some(0),
             "silent owner drops when sibling has rx"
         );
         slots[0].rate.note_rx(ibd_mono_ms().max(1));
+        let ago = |s| Instant::now() - Duration::from_secs(s);
         assert_eq!(
-            tip_hole_owner_to_drop(&[0], &slots, Instant::now() - Duration::from_secs(7)),
+            tip_hole_owner_to_drop(&req_with(&[0], ago(7)), &hole, &slots, per_peer),
             None,
             "solo with live rx is kept when young"
         );
         assert_eq!(
-            tip_hole_owner_to_drop(&[0], &slots, Instant::now() - Duration::from_secs(31)),
+            tip_hole_owner_to_drop(&req_with(&[0], ago(31)), &hole, &slots, per_peer),
             Some(0),
             "aged solo owner drops when another alive peer exists, even with densify ticks"
         );
-        let one = vec![dummy_slot(0)];
-        let mut one = one;
+        let mut one = vec![dummy_slot(0)];
         one[0].rate.note_rx(ibd_mono_ms().max(1));
         assert_eq!(
-            tip_hole_owner_to_drop(&[0], &one, Instant::now() - Duration::from_secs(31)),
+            tip_hole_owner_to_drop(&req_with(&[0], ago(31)), &hole, &one, per_peer),
             None,
             "truly solo (one live peer) with live rx stays"
         );
         slots[0].rate.progress_ms = 0;
         assert_eq!(
-            tip_hole_owner_to_drop(&[0], &slots, Instant::now() - Duration::from_secs(31)),
+            tip_hole_owner_to_drop(&req_with(&[0], ago(31)), &hole, &slots, per_peer),
             Some(0),
             "solo hung with no rx after 30s is replaced"
         );
         let mut fifo = vec![dummy_slot(0), dummy_slot(1)];
-        fifo[0].in_flight.insert(h(1));
+        fifo[0].in_flight.insert(hole);
         fifo[0].in_flight.insert(h(2));
         fifo[0].rate.note_rx(ibd_mono_ms().max(1));
+        seed_ewma(&mut fifo[0], 1_000_000);
+        seed_ewma(&mut fifo[1], 1_000_000);
         assert_eq!(
-            tip_hole_owner_to_drop(&[0], &fifo, Instant::now()),
-            Some(0),
-            "young owner with extra inflight drops when another peer exists"
-        );
-        fifo[0].in_flight.clear();
-        fifo[0].in_flight.insert(h(1));
-        assert_eq!(
-            tip_hole_owner_to_drop(&[0], &fifo, Instant::now()),
+            tip_hole_owner_to_drop(&req_with(&[0], Instant::now()), &hole, &fifo, per_peer),
             None,
-            "young owner whose only inflight is the hole stays"
+            "young owner with extra inflight stays: it has not had time to reach the hash"
+        );
+        assert_eq!(
+            tip_hole_owner_to_drop(&req_with(&[0], ago(6)), &hole, &fifo, per_peer),
+            Some(0),
+            "owner held >= 5s with extra inflight drops when an empty peer would start sooner"
+        );
+        for n in 3..6 {
+            fifo[1].in_flight.insert(h(n));
+        }
+        assert_eq!(
+            tip_hole_owner_to_drop(&req_with(&[0], ago(6)), &hole, &fifo, per_peer),
+            None,
+            "owner held >= 5s stays when no free peer would clearly start sooner"
+        );
+        fifo[1].in_flight.clear();
+        fifo[0].in_flight.clear();
+        fifo[0].in_flight.insert(hole);
+        assert_eq!(
+            tip_hole_owner_to_drop(&req_with(&[0], ago(6)), &hole, &fifo, per_peer),
+            None,
+            "owner whose only inflight is the hole stays"
         );
         let mut solo_fifo = vec![dummy_slot(0)];
-        solo_fifo[0].in_flight.insert(h(1));
+        solo_fifo[0].in_flight.insert(hole);
         solo_fifo[0].in_flight.insert(h(2));
         solo_fifo[0].rate.note_rx(ibd_mono_ms().max(1));
         assert_eq!(
-            tip_hole_owner_to_drop(&[0], &solo_fifo, Instant::now()),
+            tip_hole_owner_to_drop(&req_with(&[0], ago(6)), &hole, &solo_fifo, per_peer),
             None,
             "truly solo extra-inflight owner stays (no one else to race)"
         );
@@ -2030,7 +2099,9 @@ pub(in crate::ibd) mod tests {
         st.record_height(hole, ht);
         st.height_to_hash.insert(ht, hole);
         st.body.mark_missing(hole);
-        let req = InflightReq::new(0);
+        let mut req = InflightReq::new(0);
+        req.asked_at
+            .insert(0, Instant::now() - Duration::from_secs(6));
         st.inflight.insert(hole, req);
         st.slots[0].in_flight.insert(hole);
         st.slots[0].in_flight.insert(h(0x99));
@@ -2076,7 +2147,10 @@ pub(in crate::ibd) mod tests {
         st.record_height(hole, ht);
         st.height_to_hash.insert(ht, hole);
         st.body.mark_missing(hole);
-        st.inflight.insert(hole, InflightReq::new(0));
+        let mut req = InflightReq::new(0);
+        req.asked_at
+            .insert(0, Instant::now() - Duration::from_secs(6));
+        st.inflight.insert(hole, req);
         st.slots[0].in_flight.insert(hole);
         st.slots[0].in_flight.insert(h(0x99));
         let now = ibd_mono_ms().max(1);
