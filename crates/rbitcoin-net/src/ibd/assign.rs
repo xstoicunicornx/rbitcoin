@@ -667,8 +667,10 @@ pub(crate) fn issue_batch(
     let _ = st.slots[idx].cmd_tx.send(PeerCmd::GetData {
         hashes: batch.clone(),
     });
+    let now = Instant::now();
     for &h in &batch {
         inflight_add_peer(&mut st.inflight, h, pid);
+        st.tip_wait.note_ask(&h, pid, now);
     }
     *issued += batch.len() as u64;
     let new_unique = batch

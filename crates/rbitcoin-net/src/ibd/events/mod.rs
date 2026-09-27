@@ -458,6 +458,8 @@ fn apply_block_framed(
     if !requested {
         return;
     }
+    st.tip_wait
+        .note_delivered(&hash, peer, std::time::Instant::now());
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
     if st.body.is_rejected(&hash) || hub.has_block(&hash) {
         return;

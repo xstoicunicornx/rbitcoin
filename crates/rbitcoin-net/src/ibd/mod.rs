@@ -30,6 +30,7 @@ mod rate;
 mod reorg;
 mod state;
 mod status;
+mod tip_wait;
 
 pub use dial::connect_timeout_for;
 pub use perf_log::{format_tip_perf_sizes, read_platform_rss, ProcessRss, TipPerfSizes};
@@ -66,7 +67,7 @@ use crate::chain::ChainHub;
 use crate::codec::MAX_HEADERS_RESULTS;
 use crate::error::NetError;
 use bitcoin::p2p::Magic;
-use rbitcoin_log::{info, info_bold, warn};
+use rbitcoin_log::{debug, info, info_bold, warn};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -561,6 +562,25 @@ pub async fn ibd_cancellable(
             &mut last_progress,
             Some(confirm_feed.as_ref()),
         );
+        {
+            let next = hub
+                .tip_height()
+                .map(|t| t.saturating_add(1))
+                .and_then(|h| st.height_to_hash.get(&h).map(|&hash| (h, hash)));
+            let (body, inflight) = (&mut st.body, &st.inflight);
+            if let Some(line) = st.tip_wait.observe(
+                next,
+                |h, hash| progress::claim_ready(hub.as_ref(), body, h, hash),
+                |hash| {
+                    inflight
+                        .get(hash)
+                        .map(|r| (r.started_at, r.peers.iter().copied().collect()))
+                },
+                Instant::now(),
+            ) {
+                debug!("{line}");
+            }
+        }
         if !drain_ready_peer_and_body_events(
             &mut st,
             hub.as_ref(),
