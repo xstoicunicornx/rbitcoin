@@ -15,6 +15,7 @@ use super::exit::{
 use super::path::work_path_tips;
 use super::peer_io::{note_block_progress, note_block_rx, PeerCmd, PeerEvent};
 use super::state::IbdWorkState;
+use super::wire_diag::Outcome;
 use super::status::LoopStats;
 use super::{CONTIG_DENSIFY_AHEAD, MAX_ORDERED_HEADERS, MAX_PEER_POOL, ORDERED_HEADERS_SOFT_CAP};
 use crate::chain::ChainHub;
@@ -452,17 +453,51 @@ fn apply_block_framed(
     payload: Vec<u8>,
 ) {
     let wire_bytes = payload.len();
+    let outcome = apply_block_framed_inner(
+        st,
+        hub,
+        archive_write_next,
+        confirm_feed,
+        peer,
+        hash,
+        payload,
+    );
+    st.wire_diag
+        .note_block(peer, hash, wire_bytes, outcome, Instant::now());
+}
+
+fn apply_block_framed_inner(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    archive_write_next: &AtomicU32,
+    confirm_feed: Option<&super::confirm::ConfirmFeed>,
+    peer: usize,
+    hash: BlockHash,
+    payload: Vec<u8>,
+) -> Outcome {
+    let wire_bytes = payload.len();
     note_block_rx(&mut st.slots, peer, wire_bytes);
     // Unsolicited wire is not a body we asked for. Drop it before any copy.
     let requested = st.inflight.contains_key(&hash);
     if !requested {
-        return;
+        let at_or_below_tip = match (st.hash_height.get(&hash), hub.tip_height()) {
+            (Some(&h), Some(t)) => h <= t,
+            _ => false,
+        };
+        return if at_or_below_tip {
+            Outcome::StaleCopy
+        } else {
+            Outcome::Unsolicited
+        };
     }
     st.tip_wait
         .note_delivered(&hash, peer, std::time::Instant::now());
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-    if st.body.is_rejected(&hash) || hub.has_block(&hash) {
-        return;
+    if st.body.is_rejected(&hash) {
+        return Outcome::Rejected;
+    }
+    if hub.has_block(&hash) {
+        return Outcome::HaveBlock;
     }
     let header_fk = if let Some(&fk) = st.header_fks.get(&hash) {
         fk
@@ -471,7 +506,7 @@ fn apply_block_framed(
             Some(h) => h,
             None => {
                 st.body.mark_missing(hash);
-                return;
+                return Outcome::BadHeader;
             }
         };
         match hub.ensure_header_fk(&header) {
@@ -482,21 +517,21 @@ fn apply_block_framed(
             Err(e) => {
                 warn!("ibd: ensure_header {hash}: {e}");
                 st.body.mark_missing(hash);
-                return;
+                return Outcome::HeaderErr;
             }
         }
     };
     let tip_h = hub.tip_height().unwrap_or(0);
     let Some(height) = st.hash_height.get(&hash).copied() else {
         st.body.mark_missing(hash);
-        return;
+        return Outcome::NoHeight;
     };
     let write_next = archive_write_next.load(Ordering::Relaxed);
     let tip_hi = tip_h.saturating_add(CONTIG_DENSIFY_AHEAD);
     let densify_hi = write_next.saturating_add(CONTIG_DENSIFY_AHEAD);
     if height > tip_hi && height > densify_hi {
         st.body.mark_missing(hash);
-        return;
+        return Outcome::TooFar;
     }
     let tip_hash = hub.tip_hash();
     if height <= tip_h && tip_hash != Some(hash) {
@@ -504,16 +539,16 @@ fn apply_block_framed(
             st.reorg.hold_body(block);
             st.body.mark_pending(hash);
             if try_complete_awaiting_reorg(st, hub) {
-                return;
+                return Outcome::Reorg;
             }
         }
     }
     if super::progress::claim_ready(hub, &mut st.body, height, &hash) {
-        return;
+        return Outcome::Ready;
     }
     let raw = hash.to_byte_array();
     if hub.query.block_queue_has_hash(&raw) {
-        return;
+        return Outcome::InQueue;
     }
     match hub
         .query
@@ -525,16 +560,19 @@ fn apply_block_framed(
         Err(e) => {
             rbitcoin_log::warn!("ibd: body queue offer failed ({e}) h={height}");
             st.body.mark_missing(hash);
-            return;
+            return Outcome::QueueErr;
         }
     }
     st.body.mark_pending(hash);
     if let Some(feed) = confirm_feed {
         feed.note(height, hash);
     }
+    Outcome::Queued
 }
 
 fn apply_block_decode_failed(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
+    st.wire_diag
+        .note_block(peer, hash, 0, Outcome::DecodeFailed, Instant::now());
     note_block_progress(&mut st.slots, peer);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
     if st.body.is_pending(&hash) {
@@ -543,6 +581,7 @@ fn apply_block_decode_failed(st: &mut IbdWorkState, peer: usize, hash: BlockHash
 }
 
 fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
+    st.wire_diag.note_notfound(peer, &hashes, Instant::now());
     note_block_progress(&mut st.slots, peer);
     let mut freed = Vec::new();
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
