@@ -31,6 +31,7 @@ mod reorg;
 mod state;
 mod status;
 mod tip_wait;
+mod wire_diag;
 
 pub use dial::connect_timeout_for;
 pub use perf_log::{format_tip_perf_sizes, read_platform_rss, ProcessRss, TipPerfSizes};
@@ -563,21 +564,24 @@ pub async fn ibd_cancellable(
             Some(confirm_feed.as_ref()),
         );
         {
+            let now = Instant::now();
             let next = hub
                 .tip_height()
                 .map(|t| t.saturating_add(1))
                 .and_then(|h| st.height_to_hash.get(&h).map(|&hash| (h, hash)));
-            let (body, inflight) = (&mut st.body, &st.inflight);
-            if let Some(line) = st.tip_wait.observe(
+            let body = &mut st.body;
+            if let Some(r) = st.tip_wait.observe(
                 next,
                 |h, hash| progress::claim_ready(hub.as_ref(), body, h, hash),
-                |hash| {
-                    inflight
-                        .get(hash)
-                        .map(|r| (r.started_at, r.peers.iter().copied().collect()))
-                },
-                Instant::now(),
+                now,
             ) {
+                let detail = st.wire_diag.describe(&r.hash, r.since, &st.slots);
+                debug!("{} {detail}", r.head());
+                if !r.still {
+                    st.wire_diag.watch_aftermath(r.height, r.hash, now);
+                }
+            }
+            for line in st.wire_diag.tick(now, &st.slots) {
                 debug!("{line}");
             }
         }

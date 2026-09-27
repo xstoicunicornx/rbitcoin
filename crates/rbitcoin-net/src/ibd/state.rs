@@ -100,6 +100,8 @@ pub(crate) struct IbdWorkState {
     pub body: BodyPresence,
     /// Diagnostic: traces the body holding the tip ([`super::tip_wait`]).
     pub tip_wait: super::tip_wait::TipWaitTracker,
+    /// Diagnostic: shadow getdata queues and per-hash history ([`super::wire_diag`]).
+    pub wire_diag: super::wire_diag::WireDiag,
     /// header hash → Class A header fk (from getheaders; Block path skips store).
     pub header_fks: HashMap<BlockHash, Fk>,
     /// Best peer-advertised tip (version.start_height + learned header heights).
@@ -179,6 +181,7 @@ impl IbdWorkState {
             known_headers,
             body: BodyPresence::new(),
             tip_wait: super::tip_wait::TipWaitTracker::new(),
+            wire_diag: super::wire_diag::WireDiag::new(),
             header_fks: HashMap::new(),
             max_peer_height,
             max_ready_height: start_tip,
