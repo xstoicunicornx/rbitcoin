@@ -33,6 +33,59 @@ pub(crate) const AFTERMATH_AFTER: Duration = Duration::from_secs(60);
 const MAX_ARRIVALS: usize = 12;
 const MAX_AFTERMATH: usize = 32;
 
+/// Which assign path sent a getdata.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum AskSite {
+    ReorgNeed,
+    Densify,
+    StealHung,
+    TipHole,
+    #[cfg(test)]
+    Test,
+}
+
+impl AskSite {
+    fn tag(self) -> &'static str {
+        match self {
+            AskSite::ReorgNeed => "reorg_need",
+            AskSite::Densify => "densify",
+            AskSite::StealHung => "steal_hung",
+            AskSite::TipHole => "tip_hole",
+            #[cfg(test)]
+            AskSite::Test => "test",
+        }
+    }
+}
+
+/// Why our record that a peer was asked for a hash was last erased. A re-ask
+/// to the same peer is only possible after one of these (or an untracked
+/// clear or prune).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Erase {
+    /// `drop_hash_owner` from `cover_tip_holes`.
+    TipHoleDrop,
+    /// `drop_hash_owner` from `steal_hung_densify`.
+    StealDrop,
+    NotFound,
+    /// A requested copy arrived (cleared for every peer).
+    Delivered,
+}
+
+impl Erase {
+    fn tag(self) -> &'static str {
+        match self {
+            Erase::TipHoleDrop => "tip_hole_drop",
+            Erase::StealDrop => "steal_drop",
+            Erase::NotFound => "notfound",
+            Erase::Delivered => "delivered",
+        }
+    }
+}
+
+fn erase_tag(e: Option<Erase>) -> &'static str {
+    e.map(Erase::tag).unwrap_or("untracked")
+}
+
 /// What `apply_block_framed` did with a received body (or notfound).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Outcome {
@@ -97,6 +150,8 @@ struct PeerAsk {
     n: u32,
     /// Shadow queue depth of this peer when it was first asked for the hash.
     ahead: u64,
+    /// Last recorded erase of this (hash, peer) since the last ask.
+    erased: Option<Erase>,
 }
 
 struct Arrival {
@@ -113,6 +168,15 @@ struct HashRec {
     arrivals: Vec<Arrival>,
     total_arrivals: u32,
     arrival_bytes: u64,
+    /// Re-asks by (site, erase) tag.
+    reasks: Vec<((&'static str, &'static str), u32)>,
+}
+
+fn bump(v: &mut Vec<((&'static str, &'static str), u32)>, k: (&'static str, &'static str)) {
+    match v.iter_mut().find(|(x, _)| *x == k) {
+        Some((_, n)) => *n += 1,
+        None => v.push((k, 1)),
+    }
 }
 
 impl HashRec {
@@ -125,6 +189,7 @@ impl HashRec {
             arrivals: Vec::new(),
             total_arrivals: 0,
             arrival_bytes: 0,
+            reasks: Vec::new(),
         }
     }
 
@@ -156,6 +221,10 @@ struct Interval {
     asks: u64,
     /// Asks to a peer already asked for the same hash.
     reasks: u64,
+    /// First asks by site.
+    firsts_by_site: HashMap<&'static str, u64>,
+    /// Re-asks by (site, erase).
+    reasks_by: HashMap<(&'static str, &'static str), u64>,
     by_outcome: HashMap<Outcome, (u64, u64)>,
 }
 
@@ -178,8 +247,14 @@ impl WireDiag {
         }
     }
 
-    /// One getdata batch sent to `peer`, in wire order.
-    pub(crate) fn note_asks(&mut self, peer: usize, hashes: &[BlockHash], now: Instant) {
+    /// One getdata batch sent to `peer` by `site`, in wire order.
+    pub(crate) fn note_asks(
+        &mut self,
+        peer: usize,
+        hashes: &[BlockHash],
+        site: AskSite,
+        now: Instant,
+    ) {
         let pw = self.peers.entry(peer).or_default();
         for h in hashes {
             let ahead = pw.outstanding();
@@ -190,13 +265,18 @@ impl WireDiag {
             rec.total_asks += 1;
             if let Some(a) = rec.asks.iter_mut().find(|a| a.peer == peer) {
                 a.n += 1;
+                let k = (site.tag(), erase_tag(a.erased.take()));
                 self.iv.reasks += 1;
+                *self.iv.reasks_by.entry(k).or_default() += 1;
+                bump(&mut rec.reasks, k);
             } else {
+                *self.iv.firsts_by_site.entry(site.tag()).or_default() += 1;
                 rec.asks.push(PeerAsk {
                     peer,
                     first: now,
                     n: 1,
                     ahead,
+                    erased: None,
                 });
             }
         }
@@ -216,6 +296,23 @@ impl WireDiag {
         e.1 += bytes as u64;
         if let Some(rec) = self.hashes.get_mut(&hash) {
             rec.note_arrival(peer, outcome, bytes, now);
+            if !matches!(outcome, Outcome::StaleCopy | Outcome::Unsolicited) {
+                for a in &mut rec.asks {
+                    a.erased = Some(Erase::Delivered);
+                }
+            }
+        }
+    }
+
+    /// Our record that `peer` was asked for `hash` was erased (peer still
+    /// holds the getdata unless `why` is notfound).
+    pub(crate) fn note_erase(&mut self, hash: &BlockHash, peer: usize, why: Erase) {
+        if let Some(a) = self
+            .hashes
+            .get_mut(hash)
+            .and_then(|r| r.asks.iter_mut().find(|a| a.peer == peer))
+        {
+            a.erased = Some(why);
         }
     }
 
@@ -226,6 +323,7 @@ impl WireDiag {
             if let Some(rec) = self.hashes.get_mut(h) {
                 rec.note_arrival(peer, Outcome::NotFound, 0, now);
             }
+            self.note_erase(h, peer, Erase::NotFound);
         }
     }
 
@@ -262,7 +360,9 @@ impl WireDiag {
                 self.peer_now(a.peer, slots)
             );
         }
-        let _ = write!(s, "}} arrivals={}[", rec.total_arrivals);
+        s.push_str("} reask_by=");
+        push_counts(&mut s, rec.reasks.iter().map(|(k, n)| (*k, *n as u64)));
+        let _ = write!(s, " arrivals={}[", rec.total_arrivals);
         for (i, a) in rec.arrivals.iter().enumerate() {
             if i > 0 {
                 s.push(',');
@@ -382,7 +482,17 @@ impl WireDiag {
             }
             let _ = write!(s, "{tag}={n}/{}", fmt_bytes(*b));
         }
-        s.push(']');
+        s.push_str("] first_by={");
+        let mut firsts: Vec<_> = self.iv.firsts_by_site.iter().collect();
+        firsts.sort_by(|a, b| b.1.cmp(a.1));
+        for (i, (site, n)) in firsts.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(s, "{site}:{n}");
+        }
+        s.push_str("} reask_by=");
+        push_counts(&mut s, self.iv.reasks_by.iter().map(|(k, n)| (*k, *n)));
         let (mut wire_q, mut counted, mut max): (u64, usize, Option<(usize, u64, usize)>) =
             (0, 0, None);
         for slot in slots.iter().filter(|s| s.alive) {
@@ -399,6 +509,20 @@ impl WireDiag {
         }
         s
     }
+}
+
+/// `{site/erase:n,...}`, largest first.
+fn push_counts(s: &mut String, it: impl Iterator<Item = ((&'static str, &'static str), u64)>) {
+    let mut v: Vec<_> = it.collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    s.push('{');
+    for (i, ((site, why), n)) in v.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{site}/{why}:{n}");
+    }
+    s.push('}');
 }
 
 fn off(t: Instant, since: Instant) -> String {
