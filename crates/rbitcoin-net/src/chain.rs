@@ -1139,6 +1139,24 @@ impl ChainHub {
         tips.insert(hash, prev, height);
     }
 
+    /// Header-only height for a stored header the caller already placed at
+    /// `height`. The store walk back to a known height is capped, so after a
+    /// restart a stored header far above the connected tip has no height
+    /// until the caller hands it in, and its children fail the context check.
+    pub(crate) fn note_stored_header_height(&self, hash: BlockHash, height: u32) {
+        if self.header_height(&hash).is_some() {
+            return;
+        }
+        let Some(header) = self.header_of(&hash) else {
+            return;
+        };
+        let mut tips = self.header_tips.write().unwrap();
+        if tips.len() >= 128 && !tips.contains(&hash) {
+            tips.evict_one();
+        }
+        tips.insert(hash, header.prev_blockhash, height);
+    }
+
     /// Persist a header row only (for header-sync → out-of-order body archive).
     pub fn ensure_header(&self, header: &Header) -> Result<(), NetError> {
         let _ = self.ensure_header_fk(header)?;

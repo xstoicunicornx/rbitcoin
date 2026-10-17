@@ -521,7 +521,11 @@ pub(crate) fn run_header_batch(
 ) {
     let (mark, plan) = {
         let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
-        plan_header_batch(&mut st, hub, peer, headers)
+        let (mark, plan) = plan_header_batch(&mut st, hub, peer, headers);
+        if let HeaderPlan::Store { headers, known, .. } = &plan {
+            note_path_parent_height(&st, hub, &headers[known.len()..]);
+        }
+        (mark, plan)
     };
     match plan {
         HeaderPlan::Done => {}
@@ -586,6 +590,21 @@ pub(crate) fn run_header_batch(
                 let _ = super::header_walk::send_getheaders(&mut st, hub);
             }
         }
+    }
+}
+
+/// Hand the hub the height of a batch parent this IBD already placed on its
+/// path, so a parent far above the connected tip is not past the store's
+/// capped height walk when the batch is written off the lock.
+fn note_path_parent_height(st: &IbdWorkState, hub: &ChainHub, headers: &[bitcoin::block::Header]) {
+    let Some(parent) = headers.first().map(|h| h.prev_blockhash) else {
+        return;
+    };
+    let Some(&height) = st.hash_height.get(&parent) else {
+        return;
+    };
+    if st.is_on_path(&parent, height) {
+        hub.note_stored_header_height(parent, height);
     }
 }
 

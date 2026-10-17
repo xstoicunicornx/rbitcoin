@@ -315,3 +315,49 @@ fn failed_first_prefix_stops_search() {
     assert_eq!(values[lo - 1], 731);
     assert_eq!(probes[0], 1);
 }
+
+#[test]
+fn a_restarted_queue_tail_past_the_walk_cap_takes_the_next_headers() {
+    const CAP: u32 = 4;
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let mut prev = hub.tip_hash().unwrap();
+    let chain: Vec<bitcoin::block::Header> = (1..=20u32)
+        .map(|height| {
+            let header = mine(prev, 1_500_100_000 + height * 600, height).header;
+            prev = header.block_hash();
+            header
+        })
+        .collect();
+    hub.ensure_headers_batch(&chain[..10]).unwrap();
+    drop(hub);
+
+    let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).unwrap();
+    let hub = crate::chain::ChainHub::new(
+        q,
+        rbitcoin_consensus::ChainParams::regtest(),
+        rbitcoin_consensus::Milestone::NONE,
+    );
+    hub.set_stored_height_walk_cap(CAP);
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    super::super::path::seed_work_path_from_store(&mut st, &hub);
+    assert_eq!(st.ordered.back(), Some(&chain[9].block_hash()));
+
+    super::apply_peer_event(
+        &mut st,
+        &hub,
+        crate::ibd::peer_io::PeerEvent::Headers {
+            peer: 0,
+            headers: chain[10..].to_vec(),
+        },
+        &AtomicU32::new(0),
+        &mut crate::seeds::AddrMan::new(),
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1),
+        None,
+    );
+    assert_eq!(
+        st.ordered.back(),
+        Some(&chain[19].block_hash()),
+        "after a restart, headers that continue a queue tail farther than the walk cap above the tip are queued"
+    );
+}
