@@ -1,0 +1,3 @@
+Fixed
+
+- **A header ask no longer disconnects a peer that is still sending our blocks.** A peer answers getheaders only after the block getdata already queued at it. When the header reservation moved to a peer with blocks queued on a slow link, the 5 s ask window ran out long before its reply could arrive, and two such misses disconnected a working block peer; the next reserved peer usually had the same queue. On mainnet a minute of header asks disconnected four block peers in a row. The reserved peer already gets no new block work, so its header ask now waits until its block queue is empty, then gets the usual 5 s. A block inv from a peer that still owes us blocks is asked of the reserved peer instead.

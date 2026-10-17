@@ -2270,7 +2270,22 @@ fn arm_header_ask(st: &mut IbdWorkState, hub: &ChainHub) -> Result<bool, crate::
     let Some(peer) = st.header_walk.reserved else {
         return Ok(false);
     };
+    if owes_blocks(st, peer) {
+        return Ok(true);
+    }
     ask_header_peer(st, hub, peer, &tips)
+}
+
+/// A peer answers getheaders only after the block getdata already queued at
+/// it. The reserved peer gets no new block work while another peer is up, so
+/// its queue drains; asking before then starts the miss clock on a reply that
+/// cannot arrive yet. A lone peer does both and is asked at once.
+fn owes_blocks(st: &IbdWorkState, peer: usize) -> bool {
+    st.slots.iter().filter(|s| s.alive).count() > 1
+        && st
+            .slots
+            .iter()
+            .any(|s| s.id == peer && !s.in_flight.is_empty())
 }
 
 /// Time from connect to the first block body. `None` until a body arrives.
@@ -2357,13 +2372,16 @@ fn ensure_reserved(st: &mut IbdWorkState, above: u32, skip: Option<usize>) {
     st.header_walk.reserved = pick_header_peer(st, above, skip);
 }
 
-/// A challenge peer who is still connected and not retired.
+/// A challenge peer who is still connected, not retired, and not still
+/// sending our block getdata. A busy peer would answer only after that
+/// queue and miss; the reserved peer is asked instead.
 fn take_challenge(st: &mut IbdWorkState) -> Option<usize> {
     let peer = st.header_walk.challenge.take()?;
     let usable = st
         .slots
         .iter()
-        .any(|s| s.alive && s.id == peer && !st.header_walk.walk_quiet.contains(&peer));
+        .any(|s| s.alive && s.id == peer && !st.header_walk.walk_quiet.contains(&peer))
+        && !owes_blocks(st, peer);
     if usable {
         Some(peer)
     } else {
@@ -3191,6 +3209,79 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             None,
         );
+    }
+
+    #[test]
+    fn a_header_ask_waits_until_the_reserved_peer_has_sent_our_blocks() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-queue-wait");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let (mut busy, mut busy_rx) = slot(0);
+        for n in 0..10u8 {
+            busy.track_insert(BlockHash::from_byte_array([n; 32]));
+        }
+        let (other, mut other_rx) = slot(1);
+        let mut st = IbdWorkState::new(vec![busy, other], Some(gen), Some(0));
+        fill_queue(&mut st);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        age_header_ask(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(
+            drain_getheaders(&mut busy_rx),
+            0,
+            "a peer answers getheaders only after the block getdata queued at it"
+        );
+        assert_eq!(drain_getheaders(&mut other_rx), 0);
+        assert!(st.header_walk.header_misses.is_empty());
+
+        st.slots[0].track_clear();
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(
+            drain_getheaders(&mut busy_rx),
+            1,
+            "the reserved peer is asked once its block queue is empty"
+        );
+        assert_eq!(drain_getheaders(&mut other_rx), 0);
+    }
+
+    #[test]
+    fn a_block_inv_from_a_peer_still_sending_our_blocks_is_not_a_challenge() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-busy-inv");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let (mut quiet, mut quiet_rx) = slot(0);
+        quiet.peer_height = 0;
+        let (mut busy, mut busy_rx) = slot(1);
+        busy.peer_height = 0;
+        busy.track_insert(BlockHash::from_byte_array([3; 32]));
+        let mut st = IbdWorkState::new(vec![quiet, busy], Some(gen), Some(0));
+        let announced = mine(gen, 1);
+
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 1,
+                hashes: vec![announced.block_hash()],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        let _ = send_getheaders(&mut st, &hub).unwrap();
+        assert_eq!(
+            drain_getheaders(&mut busy_rx),
+            0,
+            "getheaders would wait behind the block getdata queued at that peer"
+        );
+        assert_eq!(
+            drain_getheaders(&mut quiet_rx),
+            1,
+            "the ask goes to the peer that is not sending our blocks"
+        );
+        assert!(st.header_walk.header_misses.is_empty());
     }
 
     fn blocks_inv(st: &mut IbdWorkState, hub: &ChainHub, peer: usize, hashes: Vec<BlockHash>) {
@@ -4548,6 +4639,7 @@ mod tests {
 
         assert!(send_getheaders(&mut st, &hub).unwrap());
         assert_eq!(drain_getheaders(&mut fast_rx), 1);
+        st.slots[0].track_clear();
         apply(&mut st, &hub, 1, vec![]);
         assert!(st.slots[1].alive, "less work does not disconnect");
         assert_eq!(drain_getheaders(&mut fast_rx), 0);
@@ -4609,6 +4701,7 @@ mod tests {
         assert_eq!(drain_getheaders(&mut quiet_rx), 1);
         assert_eq!(drain_getheaders(&mut busy_rx), 0);
         age_header_ask(&mut st);
+        st.slots[1].track_clear();
         assert!(send_getheaders(&mut st, &hub).unwrap());
         assert_eq!(
             drain_getheaders(&mut quiet_rx),
@@ -5110,6 +5203,7 @@ mod tests {
             "a refill still inside the window is not sent again"
         );
         age_header_ask(&mut st);
+        st.slots[1].track_clear();
         assert!(send_getheaders(&mut st, &hub).unwrap());
         assert_eq!(drain_getheaders(&mut quiet_rx), 0);
         assert_eq!(drain_getheaders(&mut busy_rx), 1);
@@ -5130,6 +5224,7 @@ mod tests {
         assert!(send_getheaders(&mut st, &hub).unwrap());
         assert_eq!(drain_getheaders(&mut quiet_rx), 1);
         age_header_ask(&mut st);
+        st.slots[1].track_clear();
         assert!(send_getheaders(&mut st, &hub).unwrap());
         assert_eq!(drain_getheaders(&mut quiet_rx), 0);
         assert_eq!(drain_getheaders(&mut busy_rx), 1);
