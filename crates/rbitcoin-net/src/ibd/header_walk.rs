@@ -1492,6 +1492,13 @@ fn walk_ahead_of_stored(st: &IbdWorkState) -> bool {
     st.header_walk.origin && st.header_walk.tip_height() > st.max_ordered_height
 }
 
+/// The queue can take a whole headers reply under the soft cap. A reply that
+/// continues the stored tip with less room stores a few headers and drops
+/// the rest.
+fn full_reply_fits(st: &IbdWorkState) -> bool {
+    st.ordered.len() + crate::codec::MAX_HEADERS_RESULTS <= ORDERED_HEADERS_SOFT_CAP
+}
+
 /// Queue tail, or the confirmed tip when the queue is empty.
 fn stored_top_hash(st: &IbdWorkState, hub: &ChainHub) -> Option<BlockHash> {
     st.ordered.back().copied().or_else(|| hub.tip_hash())
@@ -2234,13 +2241,14 @@ pub(crate) fn send_getheaders(
 /// Locator for one headers ask.
 ///
 /// Bitcoin answers after the first locator hash the peer knows. While the
-/// queue can take headers, that hash is the stored tip. An unproved queue
-/// also names the proved anchor under it, so a peer that does not have the
-/// guess still sends the gap. The candidate and its checkpoints follow. A
-/// full queue is look-ahead and starts at the candidate.
+/// queue can take a full reply, that hash is the stored tip. An unproved
+/// queue also names the proved anchor under it, so a peer that does not have
+/// the guess still sends the gap. The candidate and its checkpoints follow.
+/// A queue without room for a full reply is look-ahead and starts at the
+/// candidate.
 fn header_ask_locator(st: &IbdWorkState, hub: &ChainHub) -> Vec<BlockHash> {
     let mut tips = Vec::new();
-    if st.ordered.len() < ORDERED_HEADERS_SOFT_CAP {
+    if full_reply_fits(st) {
         if let Some(stored) = stored_top_hash(st, hub) {
             tips.push(stored);
         }
@@ -3181,6 +3189,43 @@ mod tests {
             &mut AddrMan::new(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             None,
+        );
+    }
+
+    #[test]
+    fn a_header_ask_continues_the_stored_tip_only_when_a_full_reply_fits() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-reply-room");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let first = mine(gen, 1);
+        let second = mine(first.block_hash(), 2);
+        let (mut s0, _rx0) = slot(0);
+        s0.peer_height = 2;
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![first, second]);
+        assert_eq!(st.header_walk.tip_hash(), Some(second.block_hash()));
+        fill_queue(&mut st);
+        while st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP {
+            let h = st.ordered.pop_front().unwrap();
+            st.ordered_set.remove(&h);
+        }
+        assert_eq!(st.ordered.len(), ORDERED_HEADERS_SOFT_CAP - 1);
+        let tail = st.ordered.back().copied().unwrap();
+        assert_eq!(
+            header_ask_locator(&st, &hub).first(),
+            Some(&second.block_hash()),
+            "one free slot under the soft cap asks past the walk tip, not for 2,000 headers after the stored tip"
+        );
+
+        while st.ordered.len() > ORDERED_HEADERS_SOFT_CAP - crate::codec::MAX_HEADERS_RESULTS {
+            let h = st.ordered.pop_front().unwrap();
+            st.ordered_set.remove(&h);
+        }
+        assert_eq!(
+            header_ask_locator(&st, &hub).first(),
+            Some(&tail),
+            "once a full reply fits, the ask continues the stored tip"
         );
     }
 
