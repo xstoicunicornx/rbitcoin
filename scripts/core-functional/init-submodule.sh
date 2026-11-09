@@ -39,9 +39,11 @@ have_files() {
 }
 
 # cargo test may stage fixtures from several processes at once.
+# Perl's flock(2) on fd 9: macOS has no flock(1). The lock is on the open
+# file, so it holds after perl exits, until this script closes fd 9.
 mkdir -p "$(dirname "$DEST")"
 exec 9>"$(dirname "$DEST")/.init-bitcoin.lock"
-flock 9
+perl -MFcntl=:flock -e 'open(my $fh, ">&=", 9) or die "fd 9: $!"; flock($fh, LOCK_EX) or die "flock: $!"'
 
 # Local object only. A missing pin falls through to fetch or clone.
 # checkout resets a dirty fixture file without sparsifying a full tree.

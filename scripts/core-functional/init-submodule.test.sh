@@ -65,6 +65,14 @@ exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$WORKDIR/bin/git"
 
+# macOS does not ship util-linux flock(1). The lock must not need it.
+cat >"$WORKDIR/bin/flock" <<'EOF'
+#!/usr/bin/env bash
+echo "flock(1) is not on macOS" >&2
+exit 127
+EOF
+chmod +x "$WORKDIR/bin/flock"
+
 run_init() {
   local dest="$1"
   GIT_WRAP_LOG="$WORKDIR/git.log" PATH="$WORKDIR/bin:$PATH" bash "$WORKDIR/init-submodule.sh" "$dest"
@@ -90,6 +98,31 @@ printf 'tampered\n' >"$WORKDIR/repo/src/test/data/script_tests.json"
 assert_ok "dirty fixture still returns" run_init "$WORKDIR/repo"
 assert_ok "dirty fixture restored" grep -q '^{}$' "$WORKDIR/repo/src/test/data/script_tests.json"
 no_network "repair did not fetch"
+
+# cargo test starts several callers at once. One holds the lock; the next waits.
+mkfifo "$WORKDIR/release"
+perl -MFcntl=:flock -e '
+  open(my $fh, ">", $ARGV[0]) or die "lock: $!";
+  flock($fh, LOCK_EX) or die "flock: $!";
+  open(my $m, ">", $ARGV[1]) or die "held: $!";
+  close $m;
+  open(my $r, "<", $ARGV[2]) or die "release: $!";
+  <$r>;
+' "$WORKDIR/.init-bitcoin.lock" "$WORKDIR/held" "$WORKDIR/release" &
+holder=$!
+for _ in $(seq 100); do
+  [[ -e "$WORKDIR/held" ]] && break
+  sleep 0.05
+done
+: >"$WORKDIR/git.log"
+run_init "$WORKDIR/repo" >"$WORKDIR/waiter.log" 2>&1 &
+waiter=$!
+sleep 1
+assert_ok "held lock blocks a second caller" kill -0 "$waiter"
+echo >"$WORKDIR/release"
+wait "$holder"
+assert_ok "second caller returns once the lock is free" wait "$waiter"
+no_network "second caller did not fetch"
 
 rm -rf "$WORKDIR/missing"
 mkdir -p "$WORKDIR/missing"
