@@ -7486,6 +7486,7 @@ fn http_request_task_methods_mine_and_accept_a_package() {
         rest_queue: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         rest: false,
         require_auth: false,
+        refused_bodies: Default::default(),
     };
     let call = |method: &'static str, params: serde_json::Value| {
         let state = state();
@@ -7638,6 +7639,7 @@ fn http_request_task_methods_mine_and_accept_a_package() {
                 rest_queue: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
                 rest: false,
                 require_auth: false,
+                refused_bodies: Default::default(),
             };
             let response = rbitcoin_rpc::server::rpc_post(
                 axum::extract::State(starved),

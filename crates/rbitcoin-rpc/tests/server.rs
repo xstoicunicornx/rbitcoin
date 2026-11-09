@@ -1731,6 +1731,7 @@ async fn empty_work_queue_is_http_503() {
         rest_queue: Arc::new(Semaphore::new(1)),
         rest: false,
         require_auth: true,
+        refused_bodies: Default::default(),
     };
     let response = rpc_post(
         State(state),
@@ -1762,6 +1763,7 @@ async fn batch_waits_to_retake_the_queue_after_a_long_poll() {
         rest_queue: Arc::new(Semaphore::new(1)),
         rest: false,
         require_auth: true,
+        refused_bodies: Default::default(),
     };
     let batch = serde_json::json!([
         {"jsonrpc":"1.0","id":1,"method":"getblockcount"},
@@ -1828,6 +1830,7 @@ async fn full_work_queue_is_503_before_the_store_budget() {
         rest_queue: Arc::new(Semaphore::new(1)),
         rest: false,
         require_auth: true,
+        refused_bodies: Default::default(),
     };
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1858,6 +1861,7 @@ async fn long_poll_queue_full_is_503_before_the_store_budget() {
         rest_queue: Arc::new(Semaphore::new(1)),
         rest: false,
         require_auth: true,
+        refused_bodies: Default::default(),
     };
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1891,6 +1895,7 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         rest_queue: Arc::new(Semaphore::new(1)),
         rest: false,
         require_auth: false,
+        refused_bodies: Default::default(),
     };
     let one = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1912,6 +1917,7 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         rest_queue: Arc::new(Semaphore::new(1)),
         rest: false,
         require_auth: false,
+        refused_bodies: Default::default(),
     };
     let batch = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1938,6 +1944,7 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         rest_queue: Arc::new(Semaphore::new(1)),
         rest: false,
         require_auth: false,
+        refused_bodies: Default::default(),
     };
     let mixed_call = tokio::spawn(async move {
         rpc_post(
@@ -1991,6 +1998,7 @@ fn store_budget_wait_does_not_need_a_pool_thread() {
             rest_queue: Arc::new(Semaphore::new(1)),
             rest: false,
             require_auth: false,
+            refused_bodies: Default::default(),
         };
         let call = tokio::spawn(async move {
             rpc_post(
@@ -2277,6 +2285,7 @@ fn gbt_app(ctx: Arc<rbitcoin_rpc::methods::RpcContext>) -> AppState {
         rest_queue: Arc::new(Semaphore::new(1)),
         rest: false,
         require_auth: false,
+        refused_bodies: Default::default(),
     }
 }
 
@@ -2732,15 +2741,27 @@ async fn http_verb(
 }
 
 async fn post_with_authorization(addr: SocketAddr, authorization: &str) -> String {
+    let body = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#;
+    post_body_after(addr, authorization, body, std::time::Duration::ZERO).await
+}
+
+/// `pause` sits between the headers and the body, so the body lands after the
+/// server has read the headers.
+async fn post_body_after(
+    addr: SocketAddr,
+    authorization: &str,
+    body: &[u8],
+    pause: std::time::Duration,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let body = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#;
     let request = format!(
         "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::sleep(pause).await;
     stream.write_all(body).await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
@@ -2909,6 +2930,37 @@ async fn tcp_accepts_bearer_and_opted_in_core_cookie_basic() {
     assert!(rejected.contains("401 Unauthorized"), "{rejected}");
     let malformed = post_with_authorization(addr, "Basic !!!").await;
     assert!(malformed.contains("401 Unauthorized"), "{malformed}");
+    // A body that lands after the headers is read before the 401, so the
+    // close is a FIN. Unread request bytes at close make the kernel send RST,
+    // and the client reads ECONNRESET instead of the 401.
+    let mut late = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#.to_vec();
+    late.resize(1024 * 1024, b' ');
+    let rejected = post_body_after(
+        addr,
+        &format!("Basic {bad}"),
+        &late,
+        std::time::Duration::from_millis(100),
+    )
+    .await;
+    assert!(rejected.contains("401 Unauthorized"), "{rejected}");
+    // Past the authorized cap a refused body is not read to its end: the
+    // server closes, and the rest of the upload fails.
+    {
+        use tokio::io::AsyncWriteExt;
+
+        let over = vec![b' '; RPC_MAX_HTTP_BODY + 8 * 1024 * 1024];
+        let head = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Basic {bad}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            over.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let sent =
+            tokio::time::timeout(std::time::Duration::from_secs(20), stream.write_all(&over))
+                .await
+                .expect("refused upload ends in time");
+        assert!(sent.is_err(), "server read a refused body past the cap");
+    }
     handle.shutdown().await;
 }
 
@@ -3400,6 +3452,7 @@ async fn earlier_wait_reports_the_tip_from_when_it_finished() {
         rest_queue: Arc::new(Semaphore::new(1)),
         rest: false,
         require_auth: false,
+        refused_bodies: Default::default(),
     };
     let body = serde_json::json!([
         {"jsonrpc":"1.0","id":1,"method":"waitfornewblock","params":[80]},

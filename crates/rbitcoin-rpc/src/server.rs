@@ -169,6 +169,8 @@ pub struct AppState {
     pub rest_queue: Arc<tokio::sync::Semaphore>,
     pub rest: bool,
     pub require_auth: bool,
+    /// Bodies of refused requests, read after the 401 ([`reject_unauthorized`]).
+    pub refused_bodies: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
 /// Omitted and `0` are [`DEFAULT_RPC_WORK_QUEUE`]. A positive `N` is `N`.
@@ -270,6 +272,7 @@ pub async fn run_rpc(
             rest_queue: rest_queue.clone(),
             rest: config.rest,
             require_auth: true,
+            refused_bodies: Default::default(),
         };
         let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
@@ -325,6 +328,7 @@ pub async fn run_rpc(
             rest_queue,
             rest: config.rest,
             require_auth: false,
+            refused_bodies: Default::default(),
         };
         let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
@@ -447,6 +451,14 @@ pub async fn reject_unauthorized(
         return next.run(req).await;
     }
     if state.require_auth && !authorized(&state.auth, state.cookie.as_ref(), req.headers()) {
+        // Answer now; the connection reads the rest of the body after the 401.
+        let mut bodies = state
+            .refused_bodies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while bodies.try_join_next().is_some() {}
+        bodies.spawn(discard_body(req.into_body()));
+        drop(bodies);
         // Challenge with the scheme a client can actually use here.
         let challenge = if state.cookie.is_some() {
             "Basic realm=\"jsonrpc\""
@@ -649,6 +661,29 @@ pub enum WaitKind {
     Block(String),
     Height(i32),
     New(String),
+}
+
+/// Read a refused request's body and drop it, one frame at a time. While this
+/// holds the body, hyper keeps reading the connection after the response, so
+/// it closes with nothing unread. Dropping the body instead closes with
+/// request bytes unread or in flight: the kernel sends RST, and the client
+/// reads ECONNRESET instead of the 401. Same cap and clock as an authorized
+/// body; past either, the close may still reset.
+async fn discard_body(mut body: axum::body::Body) {
+    use axum::body::HttpBody;
+
+    let drain = async {
+        let mut read = 0usize;
+        while let Some(Ok(frame)) =
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+        {
+            read += frame.data_ref().map_or(0, Bytes::len);
+            if read > RPC_MAX_HTTP_BODY {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(RPC_READ_TIMEOUT, drain).await;
 }
 
 async fn read_http_body(req: Request) -> Result<Bytes, Response> {
